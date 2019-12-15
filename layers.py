@@ -2,9 +2,16 @@ from __future__ import absolute_import  # __future__: 把下一個新版本的�
 from __future__ import division
 from __future__ import print_function
 import abc
+from abc import ABC
+
 import six  # Python 2 and 3 compatibility library
 import tensorflow as tf
+from tensorflow.compat.v1 import ConfigProto
+from tensorflow.compat.v1 import InteractiveSession
 import MultiHeadAttention
+tfconfig = ConfigProto(allow_soft_placement=True)
+tfconfig.gpu_options.allow_growth = True
+session = InteractiveSession(config=tfconfig)
 
 # Registry layer keys.
 ATTEND_TO_ENCODER_REGISTRY_KEY = "attend_to_encoder"
@@ -120,7 +127,7 @@ class TranslationLayer(metaclass=abc.ABCMeta):
             layer_output = activation(layer_output)
 
         if postprocess_dropout:
-            layer_output = tf.nn.dropout(layer_output, 1 - hparams.relu_dropout)
+            layer_output = tf.nn.dropout(layer_output, hparams.relu_dropout)
 
         if residual_tensor is not None:
             layer_output += residual_tensor
@@ -183,6 +190,7 @@ class ConvLayerBase(TranslationLayer):
         self._conv_type = conv_type
         self._conv_width = conv_width
         self._dilation_rate = dilation_rate
+        self.trainable_variables = 0
 
     def _conv_function(self, input_tensor, output_depth, padding):
         """Conv function that will be applied to the input tensor."""
@@ -191,22 +199,25 @@ class ConvLayerBase(TranslationLayer):
     def apply_logic(self, input_tensor, output_depth, hparams, var_scope_suffix,
                     nonpadding, mask_future, **unused_kwargs):
         """Applies conv logic to `input_tensor`."""
-        with tf.variable_scope("%s_conv_%s" % (self._conv_type, var_scope_suffix)):  # define a variable scope
-            if mask_future:
-                # Pad shift the inputs so that temporal information does not leak. This
-                # must be used in tandem with VALID padding.
-                pad_amount = int(self._conv_width - 1) * self._dilation_rate
-                logic_output = tf.pad(
-                    input_tensor, paddings=[[0, 0], [pad_amount, 0], [0, 0]])
-                padding = "VALID"
-            else:
-                logic_output = input_tensor
-                padding = "SAME"
+        # with tf.variable_scope("%s_conv_%s" % (self._conv_type, var_scope_suffix)):  # define a variable scope
+        if mask_future:
+            # Pad shift the inputs so that temporal information does not leak. This
+            # must be used in tandem with VALID padding.
+            pad_amount = int(self._conv_width - 1) * self._dilation_rate
+            logic_output = tf.pad(
+                input_tensor, paddings=[[0, 0], [pad_amount, 0], [0, 0]])
+            padding = "VALID"
+        else:
+            logic_output = input_tensor
+            padding = "SAME"
 
-            logic_output = tf.expand_dims(logic_output, 2)
-            logic_output = self._conv_function(logic_output, output_depth, padding)
-
-            logic_output = tf.squeeze(logic_output, 2)
+        logic_output = tf.expand_dims(logic_output, 2)
+        print("logic_output.shape:", logic_output.shape)
+        conv_layer = self._conv_function(output_depth, padding)
+        logic_output = conv_layer(logic_output)
+        self.trainable_variables = conv_layer.trainable_variables
+        # print(logic_output)
+        logic_output = tf.squeeze(logic_output, 2)
         return logic_output
 
 
@@ -218,7 +229,7 @@ class SeparableConvLayer(ConvLayerBase):
 
     def _conv_function(self, input_tensor, output_depth, padding):
         conv_output = tf.squeeze(input_tensor, 2)
-        separable_conv_1d = tf.layers.SeparableConv1D(
+        separable_conv_1d = tf.keras.layers.SeparableConv1D(
             output_depth,
             self._conv_width,
             padding=padding,
@@ -237,9 +248,8 @@ class StandardConvLayer(ConvLayerBase):
     def __init__(self, conv_width):
         super(StandardConvLayer, self).__init__("standard", conv_width, 1)
 
-    def _conv_function(self, input_tensor, output_depth, padding):
-        return tf.layers.conv2d(
-            input_tensor,
+    def _conv_function(self, output_depth, padding):
+        return tf.keras.layers.Conv2D(
             output_depth,  # The number of filters
             [self._conv_width, 1],
             padding=padding,
@@ -247,6 +257,7 @@ class StandardConvLayer(ConvLayerBase):
 
     def num_params(self, input_depth, output_depth, **unused_kwargs):
         return self._conv_width * input_depth * output_depth + output_depth
+        # conv_width * 1 * input_depth * output_depth(filter_num) + bias(filter_num)
 
 
 def calculate_depthwise_channel_multiplier(input_depth, output_depth):
@@ -277,8 +288,7 @@ class DepthwiseConvLayer(ConvLayerBase):
                 "input tensor (%s)." % (output_depth, input_depth))
         channel_multiplier = calculate_depthwise_channel_multiplier(
             input_depth, output_depth)
-        kernel = tf.get_variable(
-            "kernel", [self._conv_width, 1, input_depth, channel_multiplier])
+        kernel = tf.random.uniform([self._conv_width, 1, input_depth, channel_multiplier])
         return tf.nn.depthwise_conv2d(
             input_tensor,
             kernel, [1, 1, 1, 1],
@@ -330,6 +340,12 @@ class LightweightConvLayer(ConvLayerBase):
             name="lightweight_conv_%sx1_r_%s" % (str(self._conv_width),
                                                  str(self._num_repeat)))
 
+    def num_params(self, input_depth, output_depth, **unused_kwargs):
+        channel_multiplier = calculate_depthwise_channel_multiplier(
+            input_depth, output_depth)
+        return self._conv_width * (input_depth // self._num_repeat + (
+                input_depth % self._num_repeat)) * channel_multiplier
+
 
 class DilatedConvLayer(ConvLayerBase):
     """Dilated convolution TranslationLayer base class."""
@@ -339,8 +355,8 @@ class DilatedConvLayer(ConvLayerBase):
 
     def _conv_function(self, input_tensor, output_depth, padding):
         input_depth = input_tensor.shape.as_list()[-1]
-        kernel = tf.get_variable("kernel",
-                                 [self._conv_width, 1, input_depth, output_depth])
+        kernel = tf.random.uniform(
+            [self._conv_width, 1, input_depth, output_depth])
         return tf.nn.atrous_conv2d(
             input_tensor,
             kernel,
@@ -368,45 +384,47 @@ class AttentionLayer(TranslationLayer):
         self._project_v = project_v
         self._num_heads = num_heads
 
-    def _apply_logic(self,
-                     input_tensor,
-                     output_depth,
-                     hparams,
-                     var_scope_suffix,
-                     nonpadding,
-                     mask_future,
-                     decoder_self_attention_bias=None,
-                     attention_dropout_broadcast_dims=None,
-                     **kwargs):
+    def apply_logic(self,
+                    input_tensor,
+                    output_depth,
+                    hparams,
+                    var_scope_suffix,
+                    nonpadding,
+                    mask_future,
+                    decoder_self_attention_bias=None,
+                    attention_dropout_broadcast_dims=None,
+                    **kwargs):
         """Applies attention logic to `input_tensor`."""
-        with tf.variable_scope("standard_attention_layer_" + var_scope_suffix):
-            # hidden_depth = int(
-            #     input_tensor.shape.as_list()[-1] * self._hidden_dim_multiplier)
-            #
-            # attention_bias = decoder_self_attention_bias
+        # with tf.variable_scope("standard_attention_layer_" + var_scope_suffix):
+        # hidden_depth = int(
+        #     input_tensor.shape.as_list()[-1] * self._hidden_dim_multiplier)
+        #
+        # attention_bias = decoder_self_attention_bias
 
-            # TODO(davidso): This dropout rate differs from the other layers. This
-            #                should be fixed so that they all use the same dropout
-            #                rate.
-            num_heads = self._num_heads
-            if num_heads is None:
-                num_heads = hparams.num_heads
-            d_model = tf.shape(input_tensor)[-1]
-            mha = MultiHeadAttention.MultiHeadAttention(d_model, num_heads)
-            _, _, _, logic_output, _, _, _ = mha(input_tensor, input_tensor, input_tensor, mask_future)
-            # logic_output = common_attention.multihead_attention(
-            #     input_tensor,
-            #     None,
-            #     attention_bias,
-            #     hidden_depth,
-            #     hidden_depth,
-            #     output_depth,
-            #     num_heads,
-            #     hparams.attention_dropout,
-            #     attention_type=hparams.self_attention_type,
-            #     max_relative_position=hparams.max_relative_position,
-            #     dropout_broadcast_dims=attention_dropout_broadcast_dims)
+        # TODO(davidso): This dropout rate differs from the other layers. This
+        #                should be fixed so that they all use the same dropout
+        #                rate.
+        num_heads = self._num_heads
+        if num_heads is None:
+            num_heads = hparams.num_heads
+        d_model = tf.shape(input_tensor)[-1]
+        mha = MultiHeadAttention.MultiHeadAttention(d_model, num_heads)
+        _, _, _, logic_output, _, _, _ = mha(input_tensor, input_tensor, input_tensor, mask_future)
+        # logic_output = common_attention.multihead_attention(
+        #     input_tensor,
+        #     None,
+        #     attention_bias,
+        #     hidden_depth,
+        #     hidden_depth,
+        #     output_depth,
+        #     num_heads,
+        #     hparams.attention_dropout,
+        #     attention_type=hparams.self_attention_type,
+        #     max_relative_position=hparams.max_relative_position,
+        #     dropout_broadcast_dims=attention_dropout_broadcast_dims)
+
         return logic_output
+
 
     def num_params(self, input_depth, output_depth, **unused_kwargs):
         # First account for the hidden to output projection params.
@@ -425,18 +443,18 @@ class AttendToEncoderLayerBase(TranslationLayer):
         """Determine the encoder cell index to attend to."""
         raise NotImplementedError()
 
-    def _apply_logic(self,
-                     input_tensor,
-                     output_depth,
-                     hparams,
-                     var_scope_suffix,
-                     nonpadding,
-                     mask_future,
-                     encoder_decoder_attention_bias,
-                     encoder_cell_outputs,
-                     cell_number,
-                     attention_dropout_broadcast_dims=None,
-                     **unused_kwargs):
+    def apply_logic(self,
+                    input_tensor,
+                    output_depth,
+                    hparams,
+                    var_scope_suffix,
+                    nonpadding,
+                    mask_future,
+                    encoder_decoder_attention_bias,
+                    encoder_cell_outputs,
+                    cell_number,
+                    attention_dropout_broadcast_dims=None,
+                    **unused_kwargs):
         """Applies attention logic to `input_tensor`."""
         with tf.variable_scope("attend_to_encoder_layer_" + var_scope_suffix):
             hidden_depth = int(input_tensor.shape.as_list()[-1])
@@ -501,24 +519,29 @@ class GatedLinearUnitLayer(TranslationLayer):
     """Gated Linaer Unit Layer."""
 
     def __init__(self):
-        pass
+        self.trainable_variables = 0
 
-    def _apply_logic(self, input_tensor, output_depth, hparams, var_scope_suffix,
-                     nonpadding, mask_future, **unused_kwargs):
-        values = tf.layers.dense(input_tensor, output_depth)
-        gates = tf.layers.dense(
-            input_tensor, output_depth, activation=tf.nn.sigmoid)
+    def apply_logic(self, input_tensor, output_depth, hparams, var_scope_suffix,
+                    nonpadding, mask_future, **unused_kwargs):
+        values_layer = tf.keras.layers.Dense(units=output_depth)
+        values = values_layer(input_tensor)
+        values_layer_var = values_layer.trainable_variables
+        gates_layer = tf.keras.layers.Dense(
+            units=output_depth, activation=tf.nn.sigmoid)
+        gates = gates_layer(input_tensor)
+        gates_layer_var = gates_layer.trainable_variables
+        self.trainable_variables = values_layer_var+gates_layer_var
         return values * gates
 
     def num_params(self, input_depth, output_depth, **unused_kwargs):
-        return input_depth * output_depth * 2 + output_depth * 2
+        return input_depth * output_depth * 2 + output_depth * 2  # weights plus bias
 
 
 class IdentityLayer(TranslationLayer):
     """Identity TranslationLayer."""
 
-    def _apply_logic(self, input_tensor, output_depth, hparams, var_scope_suffix,
-                     nonpadding, mask_future, **unused_kwargs):
+    def apply_logic(self, input_tensor, output_depth, hparams, var_scope_suffix,
+                    nonpadding, mask_future, **unused_kwargs):
         input_depth = input_tensor.shape.as_list()[-1]
         if output_depth != input_depth:
             raise ValueError(
@@ -536,107 +559,105 @@ def register_encoder_decoder_layer(name, translation_layer):
 
 
 # Register all strictly decoder layers.
-DECODER_LAYERS.register_layer(
-    ATTEND_TO_ENCODER_REGISTRY_KEY,
-    AttendToEncoderTopDownLayer(delay=0, increment_step=0))
+# DECODER_LAYERS.register_layer(
+#     ATTEND_TO_ENCODER_REGISTRY_KEY,
+#     AttendToEncoderTopDownLayer(delay=0, increment_step=0))
 
 # Register all encoder and decoder layers.
-register_encoder_decoder_layer(IDENTITY_REGISTRY_KEY, IdentityLayer())
-
-register_encoder_decoder_layer(SEPARABLE_CONV_3X1_REGISTRY_KEY,
-                               SeparableConvLayer(conv_width=3))
-register_encoder_decoder_layer(SEPARABLE_CONV_5X1_REGISTRY_KEY,
-                               SeparableConvLayer(conv_width=5))
-register_encoder_decoder_layer(SEPARABLE_CONV_7X1_REGISTRY_KEY,
-                               SeparableConvLayer(conv_width=7))
-register_encoder_decoder_layer(SEPARABLE_CONV_9X1_REGISTRY_KEY,
-                               SeparableConvLayer(conv_width=9))
-register_encoder_decoder_layer(SEPARABLE_CONV_11X1_REGISTRY_KEY,
-                               SeparableConvLayer(conv_width=11))
-register_encoder_decoder_layer(SEPARABLE_CONV_13X1_REGISTRY_KEY,
-                               SeparableConvLayer(conv_width=13))
-register_encoder_decoder_layer(SEPARABLE_CONV_15X1_REGISTRY_KEY,
-                               SeparableConvLayer(conv_width=15))
+# register_encoder_decoder_layer(IDENTITY_REGISTRY_KEY, IdentityLayer())
+#
+# register_encoder_decoder_layer(SEPARABLE_CONV_3X1_REGISTRY_KEY,
+#                                SeparableConvLayer(conv_width=3))
+# register_encoder_decoder_layer(SEPARABLE_CONV_5X1_REGISTRY_KEY,
+#                                SeparableConvLayer(conv_width=5))
+# register_encoder_decoder_layer(SEPARABLE_CONV_7X1_REGISTRY_KEY,
+#                                SeparableConvLayer(conv_width=7))
+# register_encoder_decoder_layer(SEPARABLE_CONV_9X1_REGISTRY_KEY,
+#                                SeparableConvLayer(conv_width=9))
+# register_encoder_decoder_layer(SEPARABLE_CONV_11X1_REGISTRY_KEY,
+#                                SeparableConvLayer(conv_width=11))
+# register_encoder_decoder_layer(SEPARABLE_CONV_13X1_REGISTRY_KEY,
+#                                SeparableConvLayer(conv_width=13))
+# register_encoder_decoder_layer(SEPARABLE_CONV_15X1_REGISTRY_KEY,
+#                                SeparableConvLayer(conv_width=15))
 register_encoder_decoder_layer(STANDARD_CONV_1X1_REGISTRY_KEY,
                                StandardConvLayer(conv_width=1))
 register_encoder_decoder_layer(STANDARD_CONV_3X1_REGISTRY_KEY,
                                StandardConvLayer(conv_width=3))
 register_encoder_decoder_layer(STANDARD_CONV_5X1_REGISTRY_KEY,
                                StandardConvLayer(conv_width=5))
-register_encoder_decoder_layer(DEPTHWISE_CONV_3X1_REGISTRY_KEY,
-                               DepthwiseConvLayer(conv_width=3))
-register_encoder_decoder_layer(DEPTHWISE_CONV_5X1_REGISTRY_KEY,
-                               DepthwiseConvLayer(conv_width=5))
-register_encoder_decoder_layer(DEPTHWISE_CONV_7X1_REGISTRY_KEY,
-                               DepthwiseConvLayer(conv_width=7))
-register_encoder_decoder_layer(DILATED_CONV_3X1_REGISTRY_KEY,
-                               DilatedConvLayer(conv_width=3))
-register_encoder_decoder_layer(DILATED_CONV_5X1_REGISTRY_KEY,
-                               DilatedConvLayer(conv_width=5))
-
-
-register_encoder_decoder_layer(LIGHTWEIGHT_CONV_3X1_R_1_REGISTRY_KEY,
-                               LightweightConvLayer(conv_width=3, num_repeat=1))
-register_encoder_decoder_layer(LIGHTWEIGHT_CONV_3X1_R_4_REGISTRY_KEY,
-                               LightweightConvLayer(conv_width=3, num_repeat=4))
-register_encoder_decoder_layer(
-    LIGHTWEIGHT_CONV_3X1_R_16_REGISTRY_KEY,
-    LightweightConvLayer(conv_width=3, num_repeat=16))
-register_encoder_decoder_layer(LIGHTWEIGHT_CONV_5X1_R_1_REGISTRY_KEY,
-                               LightweightConvLayer(conv_width=5, num_repeat=1))
-register_encoder_decoder_layer(LIGHTWEIGHT_CONV_5X1_R_4_REGISTRY_KEY,
-                               LightweightConvLayer(conv_width=5, num_repeat=4))
-register_encoder_decoder_layer(
-    LIGHTWEIGHT_CONV_5X1_R_16_REGISTRY_KEY,
-    LightweightConvLayer(conv_width=5, num_repeat=16))
-register_encoder_decoder_layer(LIGHTWEIGHT_CONV_7X1_R_1_REGISTRY_KEY,
-                               LightweightConvLayer(conv_width=7, num_repeat=1))
-register_encoder_decoder_layer(LIGHTWEIGHT_CONV_7X1_R_4_REGISTRY_KEY,
-                               LightweightConvLayer(conv_width=7, num_repeat=4))
-register_encoder_decoder_layer(
-    LIGHTWEIGHT_CONV_7X1_R_16_REGISTRY_KEY,
-    LightweightConvLayer(conv_width=7, num_repeat=16))
-register_encoder_decoder_layer(
-    LIGHTWEIGHT_CONV_15X1_R_1_REGISTRY_KEY,
-    LightweightConvLayer(conv_width=15, num_repeat=1))
-register_encoder_decoder_layer(
-    LIGHTWEIGHT_CONV_15X1_R_4_REGISTRY_KEY,
-    LightweightConvLayer(conv_width=15, num_repeat=4))
-register_encoder_decoder_layer(
-    LIGHTWEIGHT_CONV_15X1_R_16_REGISTRY_KEY,
-    LightweightConvLayer(conv_width=15, num_repeat=16))
+# register_encoder_decoder_layer(DEPTHWISE_CONV_3X1_REGISTRY_KEY,
+#                                DepthwiseConvLayer(conv_width=3))
+# register_encoder_decoder_layer(DEPTHWISE_CONV_5X1_REGISTRY_KEY,
+#                                DepthwiseConvLayer(conv_width=5))
+# register_encoder_decoder_layer(DEPTHWISE_CONV_7X1_REGISTRY_KEY,
+#                                DepthwiseConvLayer(conv_width=7))
+# register_encoder_decoder_layer(DILATED_CONV_3X1_REGISTRY_KEY,
+#                                DilatedConvLayer(conv_width=3))
+# register_encoder_decoder_layer(DILATED_CONV_5X1_REGISTRY_KEY,
+#                                DilatedConvLayer(conv_width=5))
+#
+# register_encoder_decoder_layer(LIGHTWEIGHT_CONV_3X1_R_1_REGISTRY_KEY,
+#                                LightweightConvLayer(conv_width=3, num_repeat=1))
+# register_encoder_decoder_layer(LIGHTWEIGHT_CONV_3X1_R_4_REGISTRY_KEY,
+#                                LightweightConvLayer(conv_width=3, num_repeat=4))
+# register_encoder_decoder_layer(
+#     LIGHTWEIGHT_CONV_3X1_R_16_REGISTRY_KEY,
+#     LightweightConvLayer(conv_width=3, num_repeat=16))
+# register_encoder_decoder_layer(LIGHTWEIGHT_CONV_5X1_R_1_REGISTRY_KEY,
+#                                LightweightConvLayer(conv_width=5, num_repeat=1))
+# register_encoder_decoder_layer(LIGHTWEIGHT_CONV_5X1_R_4_REGISTRY_KEY,
+#                                LightweightConvLayer(conv_width=5, num_repeat=4))
+# register_encoder_decoder_layer(
+#     LIGHTWEIGHT_CONV_5X1_R_16_REGISTRY_KEY,
+#     LightweightConvLayer(conv_width=5, num_repeat=16))
+# register_encoder_decoder_layer(LIGHTWEIGHT_CONV_7X1_R_1_REGISTRY_KEY,
+#                                LightweightConvLayer(conv_width=7, num_repeat=1))
+# register_encoder_decoder_layer(LIGHTWEIGHT_CONV_7X1_R_4_REGISTRY_KEY,
+#                                LightweightConvLayer(conv_width=7, num_repeat=4))
+# register_encoder_decoder_layer(
+#     LIGHTWEIGHT_CONV_7X1_R_16_REGISTRY_KEY,
+#     LightweightConvLayer(conv_width=7, num_repeat=16))
+# register_encoder_decoder_layer(
+#     LIGHTWEIGHT_CONV_15X1_R_1_REGISTRY_KEY,
+#     LightweightConvLayer(conv_width=15, num_repeat=1))
+# register_encoder_decoder_layer(
+#     LIGHTWEIGHT_CONV_15X1_R_4_REGISTRY_KEY,
+#     LightweightConvLayer(conv_width=15, num_repeat=4))
+# register_encoder_decoder_layer(
+#     LIGHTWEIGHT_CONV_15X1_R_16_REGISTRY_KEY,
+#     LightweightConvLayer(conv_width=15, num_repeat=16))
 
 register_encoder_decoder_layer(
     GATED_LINEAR_UNIT_REGISTRY_KEY,
     GatedLinearUnitLayer())
 
-
-register_encoder_decoder_layer(
-    STANDARD_ATTENTION_REGISTRY_KEY,
-    AttentionLayer(
-        hidden_dim_multiplier=1, project_q=True, project_k=True,
-        project_v=True))
-register_encoder_decoder_layer(
-    ATTENTION_16_HEADS_REGISTRY_KEY,
-    AttentionLayer(
-        hidden_dim_multiplier=1,
-        project_q=True,
-        project_k=True,
-        project_v=True,
-        num_heads=16))
-register_encoder_decoder_layer(
-    ATTENTION_32_HEADS_REGISTRY_KEY,
-    AttentionLayer(
-        hidden_dim_multiplier=1,
-        project_q=True,
-        project_k=True,
-        project_v=True,
-        num_heads=32))
-register_encoder_decoder_layer(
-    ATTENTION_4_HEADS_REGISTRY_KEY,
-    AttentionLayer(
-        hidden_dim_multiplier=1,
-        project_q=True,
-        project_k=True,
-        project_v=True,
-        num_heads=4))
+# register_encoder_decoder_layer(
+#     STANDARD_ATTENTION_REGISTRY_KEY,
+#     AttentionLayer(
+#         hidden_dim_multiplier=1, project_q=True, project_k=True,
+#         project_v=True))
+# register_encoder_decoder_layer(
+#     ATTENTION_16_HEADS_REGISTRY_KEY,
+#     AttentionLayer(
+#         hidden_dim_multiplier=1,
+#         project_q=True,
+#         project_k=True,
+#         project_v=True,
+#         num_heads=16))
+# register_encoder_decoder_layer(
+#     ATTENTION_32_HEADS_REGISTRY_KEY,
+#     AttentionLayer(
+#         hidden_dim_multiplier=1,
+#         project_q=True,
+#         project_k=True,
+#         project_v=True,
+#         num_heads=32))
+# register_encoder_decoder_layer(
+#     ATTENTION_4_HEADS_REGISTRY_KEY,
+#     AttentionLayer(
+#         hidden_dim_multiplier=1,
+#         project_q=True,
+#         project_k=True,
+#         project_v=True,
+#         num_heads=4))
